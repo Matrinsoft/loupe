@@ -1,0 +1,351 @@
+use crate::util::djb_hash;
+use crate::write::item::{HashItemBuilder, HashValue};
+use std::rc::Rc;
+
+/// A hash table with a fixed number of buckets.
+///
+/// This is used as an intermediate representation before serializing
+/// hashtable data in a HVDB file.
+#[derive(Debug)]
+pub struct SimpleHashTable<'a> {
+    buckets: Vec<Option<Rc<HashItemBuilder<'a>>>>,
+    n_items: usize,
+}
+
+impl<'a> SimpleHashTable<'a> {
+    /// Create a hash table with a number of buckets.
+    pub fn with_n_buckets(n_buckets: usize) -> Self {
+        let mut buckets = Vec::with_capacity(n_buckets);
+        buckets.resize_with(n_buckets, || None);
+
+        Self {
+            buckets,
+            n_items: 0,
+        }
+    }
+
+    /// The number of buckets of the hash table. This number is fixed and does not change.
+    pub fn n_buckets(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// How many items are contained in the hash table.
+    pub fn n_items(&self) -> usize {
+        self.n_items
+    }
+
+    /// Retrieve the hash bucket for the provided [`u32`] hash value
+    fn hash_bucket(&self, hash_value: u32) -> usize {
+        (hash_value % self.buckets.len() as u32) as usize
+    }
+
+    /// Insert a new item into the hash table.
+    ///
+    /// Returns the created hash item.
+    pub fn insert(&mut self, key: &str, item: HashValue<'a>) -> Rc<HashItemBuilder<'a>> {
+        let hash_value = djb_hash(key);
+        let bucket = self.hash_bucket(hash_value);
+
+        let item = Rc::new(HashItemBuilder::new(key, hash_value, item));
+        let replaced_item = self.buckets[bucket].replace(item.clone());
+        if let Some(replaced_item) = replaced_item {
+            if replaced_item.key() == key {
+                // Replace
+                self.buckets[bucket]
+                    .as_ref()
+                    .unwrap()
+                    .next()
+                    .replace(replaced_item.next().take());
+            } else {
+                // Insert
+                self.buckets[bucket]
+                    .as_ref()
+                    .unwrap()
+                    .next()
+                    .replace(Some(replaced_item));
+                self.n_items += 1;
+            }
+        } else {
+            // Insert to empty bucket
+            self.n_items += 1;
+        }
+
+        item
+    }
+
+    #[allow(dead_code)]
+    /// Remove the item with the specified key
+    pub fn remove(&mut self, key: &str) -> bool {
+        let hash_value = djb_hash(key);
+        let bucket = self.hash_bucket(hash_value);
+
+        // Remove the item if it already exists
+        match self.get_from_bucket(key, bucket) {
+            Some((previous, item)) => {
+                if let Some(previous) = previous {
+                    previous.next().replace(item.next().take());
+                } else {
+                    self.buckets[bucket] = item.next().take();
+                }
+
+                self.n_items -= 1;
+
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Retrieve an item with the specified key from the specified bucket.
+    fn get_from_bucket(
+        &self,
+        key: &str,
+        bucket: usize,
+    ) -> Option<(Option<Rc<HashItemBuilder<'a>>>, Rc<HashItemBuilder<'a>>)> {
+        let mut item = self.buckets.get(bucket)?.clone();
+        let mut previous = None;
+
+        while let Some(current_item) = item {
+            if current_item.key() == key {
+                return Some((previous, current_item));
+            } else {
+                previous = Some(current_item.clone());
+                item = current_item.next().borrow().clone();
+            }
+        }
+
+        None
+    }
+
+    /// Returns an item corresponding to the key.
+    pub fn get(&self, key: &str) -> Option<Rc<HashItemBuilder<'a>>> {
+        let hash_value = djb_hash(key);
+        let bucket = self.hash_bucket(hash_value);
+        self.get_from_bucket(key, bucket).map(|r| r.1)
+    }
+
+    /// Iterator over the hash table items.
+    pub fn iter(&self) -> SimpleHashTableIter<'_, 'a> {
+        SimpleHashTableIter {
+            hash_table: self,
+            bucket: 0,
+            last_item: None,
+        }
+    }
+
+    /// Iterator over the items in the specified bucket.
+    pub fn iter_bucket(&self, bucket: usize) -> SimpleHashTableBucketIter<'_, 'a> {
+        SimpleHashTableBucketIter {
+            hash_table: self,
+            bucket,
+            last_item: None,
+        }
+    }
+}
+
+/// Iterator over the items in a specific bucket of a [`SimpleHashTable`].
+pub struct SimpleHashTableBucketIter<'it, 'h> {
+    hash_table: &'it SimpleHashTable<'h>,
+    bucket: usize,
+    last_item: Option<Rc<HashItemBuilder<'h>>>,
+}
+
+impl<'h> Iterator for SimpleHashTableBucketIter<'_, 'h> {
+    type Item = Rc<HashItemBuilder<'h>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.last_item.clone() {
+            Some(last_item) => {
+                // First check if there are more items in this bucket
+                match &*last_item.next().borrow() {
+                    Some(next_item) => {
+                        // Next item in the same bucket
+                        self.last_item = Some(next_item.clone());
+                        Some(next_item.clone())
+                    }
+                    _ => {
+                        // Last item in the bucket, return
+                        None
+                    }
+                }
+            }
+            _ => {
+                match self.hash_table.buckets.get(self.bucket).cloned() {
+                    Some(Some(item)) => {
+                        // We found something: Bucket exists and is not empty
+                        self.last_item = Some(item.clone());
+                        Some(item.clone())
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+/// Iterator over the items of a [`SimpleHashTable`].
+pub struct SimpleHashTableIter<'it, 'h> {
+    hash_table: &'it SimpleHashTable<'h>,
+    bucket: usize,
+    last_item: Option<Rc<HashItemBuilder<'h>>>,
+}
+
+impl<'h> Iterator for SimpleHashTableIter<'_, 'h> {
+    type Item = (usize, Rc<HashItemBuilder<'h>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(last_item) = self.last_item.clone() {
+            // First check if there are more items in this bucket
+            match &*last_item.next().borrow() {
+                Some(next_item) => {
+                    // Next item in the same bucket
+                    self.last_item = Some(next_item.clone());
+                    return Some((self.bucket, next_item.clone()));
+                }
+                _ => {
+                    // Last item in the bucket, check the next bucket
+                    self.bucket += 1;
+                }
+            }
+        }
+
+        while let Some(bucket_item) = self.hash_table.buckets.get(self.bucket) {
+            self.last_item = None;
+
+            // This bucket might be empty
+            if let Some(item) = bucket_item {
+                // We found something
+                self.last_item = Some(item.clone());
+                return Some((self.bucket, item.clone()));
+            } else {
+                // Empty bucket, continue with next bucket
+                self.bucket += 1;
+            }
+        }
+
+        // Nothing left
+        None
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashSet;
+
+    use matches::assert_matches;
+
+    use crate::Endian;
+    use crate::variant::{DecodeVariant, EncodeVariant};
+    use crate::write::hash::SimpleHashTable;
+    use crate::write::item::HashValue;
+
+    #[test]
+    fn derives() {
+        let table = SimpleHashTable::with_n_buckets(1);
+        assert!(format!("{table:?}").contains("SimpleHashTable"));
+    }
+
+    #[test]
+    fn simple_hash_table() {
+        let mut table: SimpleHashTable = SimpleHashTable::with_n_buckets(10);
+        let item = HashValue::from_value(zvariant::Value::new("test_overwrite"));
+        table.insert("test", item);
+        assert_eq!(table.n_items(), 1);
+        let item2 = HashValue::from_value(zvariant::Value::new("test"));
+        table.insert("test", item2);
+        assert_eq!(table.n_items(), 1);
+        assert_eq!(
+            table
+                .get("test")
+                .unwrap()
+                .value_ref()
+                .encode_value(Endian::Big)
+                .unwrap(),
+            zvariant::Value::from(&"test").encode(Endian::Big).unwrap()
+        );
+    }
+
+    #[test]
+    fn simple_hash_table_2() {
+        let mut table: SimpleHashTable = SimpleHashTable::with_n_buckets(10);
+        for index in 0..20 {
+            table.insert(
+                &format!("{index}"),
+                HashValue::from_value(zvariant::Value::new(index)),
+            );
+        }
+
+        assert_eq!(table.n_items(), 20);
+
+        for index in 0..20 {
+            assert_eq!(
+                zvariant::Value::new(index).encode(Endian::Big).unwrap(),
+                table
+                    .get(&format!("{index}"))
+                    .unwrap()
+                    .value_ref()
+                    .encode_value(Endian::Big)
+                    .unwrap()
+            );
+        }
+
+        for index in 0..10 {
+            let index = index * 2;
+            assert!(table.remove(&format!("{index}")));
+        }
+
+        for index in 0..20 {
+            let item = table.get(&format!("{index}"));
+            assert_eq!(index % 2 == 1, item.is_some());
+        }
+
+        assert!(!table.remove("50"));
+    }
+
+    #[test]
+    fn simple_hash_table_iter() {
+        let mut table: SimpleHashTable = SimpleHashTable::with_n_buckets(10);
+        for index in 0..20 {
+            table.insert(
+                &format!("{index}"),
+                HashValue::from_value(zvariant::Value::new(index)),
+            );
+        }
+
+        let mut iter = table.iter();
+        for _ in 0..20 {
+            let data = iter
+                .next()
+                .unwrap()
+                .1
+                .value()
+                .borrow()
+                .encode_value(Endian::Little)
+                .unwrap();
+            let value = i32::decode(&data, Endian::Little).unwrap();
+            assert_matches!(value, 0..=19);
+        }
+    }
+
+    #[test]
+    fn simple_hash_table_bucket_iter() {
+        let mut table: SimpleHashTable = SimpleHashTable::with_n_buckets(10);
+        for index in 0..20 {
+            table.insert(
+                &format!("{index}"),
+                HashValue::from_value(zvariant::Value::new(index)),
+            );
+        }
+
+        let mut values: HashSet<i32> = (0..20).collect();
+        for bucket in 0..table.n_buckets() {
+            let iter = table.iter_bucket(bucket);
+            for next in iter {
+                let data = next.value().borrow().encode_value(Endian::Little).unwrap();
+                let num: i32 = i32::decode(&data, Endian::Little).unwrap();
+                println!("{data:?}");
+                assert!(values.remove(&num));
+            }
+        }
+    }
+}

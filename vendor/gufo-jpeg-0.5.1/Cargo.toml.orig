@@ -1,0 +1,23 @@
+[package]
+name = "gufo-jpeg"
+description = "Inspect JPEG image structure"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+encoder = ["dep:jpeg-encoder"]
+
+[dependencies]
+gufo-common.workspace = true
+indexmap.workspace = true
+jpeg-encoder = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+zerocopy = { workspace = true, features = ["derive"] }

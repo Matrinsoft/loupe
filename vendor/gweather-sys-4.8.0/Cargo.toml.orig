@@ -1,0 +1,51 @@
+[package]
+name = "gweather-sys"
+version = "4.8.0"
+authors = ["Jamie Murphy <hello@itsjamie.dev>"]
+edition = "2024"
+build = "build.rs"
+categories = ["api-bindings"]
+keywords = ["gtk4-rs", "gnome", "weather", "gweather"]
+description = "FFI bindings for libgweather"
+license = "MIT"
+homepage = "https://gitlab.gnome.org/World/Rust/libgweather-rs"
+repository = "https://gitlab.gnome.org/World/Rust/libgweather-rs"
+documentation = "https://world.pages.gitlab.gnome.org/Rust/libgweather-rs/stable/latest/docs/gweather_sys"
+
+[package.metadata.system-deps.gweather4]
+name = "gweather4"
+version = "4"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--generate-link-to-definition"]
+
+[lib]
+name = "gweather_sys"
+
+[dependencies]
+libc = "0.2"
+
+[dependencies.gio-sys]
+git = "https://github.com/gtk-rs/gtk-rs-core"
+branch = "0.22"
+version = "0.22"
+
+[dependencies.glib-sys]
+git = "https://github.com/gtk-rs/gtk-rs-core"
+branch = "0.22"
+version = "0.22"
+
+[dependencies.gobject-sys]
+git = "https://github.com/gtk-rs/gtk-rs-core"
+branch = "0.22"
+version = "0.22"
+
+[build-dependencies]
+system-deps = "7"
+
+[dev-dependencies]
+shell-words = "1.0.0"
+tempfile = "3"
+
+[features]

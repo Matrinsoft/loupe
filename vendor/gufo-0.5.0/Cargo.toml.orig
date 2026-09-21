@@ -1,0 +1,46 @@
+[package]
+name = "gufo"
+description = "Gufo"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+chrono = [
+    "dep:chrono",
+    "gufo-common/chrono",
+    "gufo-exif/chrono",
+    "gufo-xmp/chrono",
+]
+jpeg = ["dep:gufo-jpeg"]
+png = ["dep:gufo-png"]
+svg = ["dep:gufo-svg"]
+tiff = ["dep:gufo-tiff"]
+webp = ["dep:gufo-webp"]
+all-image-formats = ["jpeg", "png", "svg", "tiff", "webp"]
+
+[dependencies]
+chrono = { workspace = true, optional = true }
+gufo-common.workspace = true
+gufo-exif.workspace = true
+gufo-jpeg = { workspace = true, optional = true }
+gufo-png = { workspace = true, optional = true }
+gufo-svg = { workspace = true, optional = true }
+gufo-tiff = { workspace = true, optional = true }
+gufo-webp = { workspace = true, optional = true }
+gufo-xmp.workspace = true
+static_assertions.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[[example]]
+name = "show-metadata"
+required-features = ["chrono"]
+
+[dev-dependencies]
+gufo = { path = ".", features = ["all-image-formats", "chrono"] }

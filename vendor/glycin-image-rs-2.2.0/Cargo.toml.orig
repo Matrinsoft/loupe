@@ -1,0 +1,52 @@
+[package]
+name = "glycin-image-rs"
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["external"]
+builtin = ["glycin-utils/builtin"]
+external = ["glycin-utils/external"]
+
+[dependencies]
+glycin-utils = { workspace = true, features = [
+    "async-io",
+    "image-rs",
+    "loader-utils",
+] }
+gufo-common.workspace = true
+gufo-exif.workspace = true
+gufo = { workspace = true, features = ["jpeg", "png", "tiff", "webp"] }
+gufo-jpeg = { workspace = true, features = ["encoder"] }
+image = { workspace = true, features = [
+    "bmp",
+    "dds",
+    "exr",
+    "ff",
+    "gif",
+    "hdr",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "qoi",
+    "tga",
+    "tiff",
+    "webp",
+] }
+log.workspace = true
+jpeg-encoder = "0.7.0"
+# Force newer version for bugfixes
+zune-jpeg = "0.5.11"
+image-extras.workspace = true
+hayro-jpeg2000 = { workspace = true, features = ["image"] }
+exr = "1.74.0"
+moxcms = "0.8.1"
+tiff = "0.11.3"
+bytemuck.workspace = true

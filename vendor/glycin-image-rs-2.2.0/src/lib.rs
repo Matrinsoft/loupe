@@ -1,0 +1,545 @@
+#![allow(clippy::large_enum_variant)]
+
+mod animated;
+mod editor;
+mod exr;
+
+use std::io::{Cursor, Read};
+use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+pub use editor::ImgEditor;
+use glycin_utils::image_rs::Handler;
+use glycin_utils::*;
+use gufo_common::cicp::Cicp;
+use gufo_common::physical_dimension::PixelDensity;
+use image::{AnimationDecoder, ImageDecoder, ImageResult, Limits, codecs};
+
+type Reader = Cursor<Vec<u8>>;
+type FrameReceiver = Receiver<Result<(Frame<LocalMemory>, bool), ProcessError>>;
+type FrameSender = Sender<Result<(Frame<LocalMemory>, bool), ProcessError>>;
+
+#[cfg(feature = "builtin")]
+#[derive(Debug, Clone)]
+pub struct BuiltinImageRs;
+
+#[cfg(feature = "builtin")]
+impl Builtin for BuiltinImageRs {
+    fn config(&self) -> &'static str {
+        include_str!("../glycin-image-rs.conf")
+    }
+
+    fn name(&self) -> &'static str {
+        "image-rs"
+    }
+}
+
+#[derive(Default)]
+pub struct ImgLoader {
+    pub decoder: Mutex<Option<Decoder>>,
+    pub cicp: Mutex<Option<Cicp>>,
+    pub pixel_density: Option<PixelDensity>,
+}
+
+pub enum Decoder {
+    ImageRsStatic(ImageRsFormat<Reader>),
+    ImageRsAnimated {
+        join_handle: std::thread::JoinHandle<()>,
+        frame_receiver: FrameReceiver,
+    },
+    Exr(Vec<u8>),
+}
+
+impl LoaderImplementation for ImgLoader {
+    fn load<B: ByteData, R: Read>(
+        mut stream: R,
+        mime_type: String,
+        _details: InitializationDetails,
+    ) -> Result<(Self, ImageDetails<B>), ProcessError> {
+        image_extras::register();
+
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).internal_error()?;
+
+        if mime_type == "image/x-exr" {
+            let metadata = exr::metadata(&buf)?;
+            return Ok((
+                ImgLoader {
+                    decoder: Mutex::new(Some(Decoder::Exr(buf))),
+                    ..Default::default()
+                },
+                metadata,
+            ));
+        }
+
+        let data = Cursor::new(buf);
+        let mut format = ImageRsFormat::create(data.clone(), &mime_type)?;
+        if let Err(err) = format.set_no_limits() {
+            eprint!("Failed to unset decoder limits: {err}");
+        }
+        let mut image_info = format.info();
+
+        // TODO: Unnecessary clone of data
+        let metadata = gufo::RawMetadata::for_guessed(data.into_inner());
+
+        let mut pixel_density = None;
+
+        let data = match metadata {
+            Ok((metadata, data)) => {
+                image_info.metadata_exif = metadata
+                    .exif
+                    .first()
+                    .map(|x| B::try_from_slice(x))
+                    .transpose()
+                    .expected_error()?;
+
+                image_info.metadata_xmp = metadata
+                    .xmp
+                    .first()
+                    .map(|x| B::try_from_slice(x))
+                    .transpose()
+                    .expected_error()?;
+
+                pixel_density = metadata.pixel_density();
+
+                image_info.metadata_key_value = Some(metadata.key_value);
+
+                data
+            }
+            Err(err) => err.into_inner(),
+        };
+
+        if image_info.metadata_exif.is_none() {
+            image_info.metadata_exif = format
+                .exif_metadata()
+                .ok()
+                .flatten()
+                .map(|x| B::try_from_vec(x))
+                .transpose()
+                .expected_error()?;
+        }
+
+        if image_info.metadata_xmp.is_none() {
+            image_info.metadata_xmp = format
+                .xmp_metadata()
+                .ok()
+                .flatten()
+                .map(|x| B::try_from_vec(x))
+                .transpose()
+                .expected_error()?;
+        }
+
+        let loader_impelementation = ImgLoader {
+            pixel_density,
+            ..Default::default()
+        };
+
+        let gufo_image = gufo::Image::new(data);
+        let data = Cursor::new(match gufo_image {
+            Ok(gufo_image) => {
+                *loader_impelementation.cicp.lock().unwrap() = gufo_image.cicp();
+                gufo_image.into_inner()
+            }
+            Err(err) => err.into_inner(),
+        });
+
+        // Radiance HDR returns linear data
+        if mime_type == "image/vnd.radiance" {
+            *loader_impelementation.cicp.lock().unwrap() = Some(Cicp {
+                color_primaries: gufo_common::cicp::ColorPrimaries::Srgb,
+                transfer_characteristics: gufo_common::cicp::TransferCharacteristics::Linear,
+                matrix_coefficients: gufo_common::cicp::MatrixCoefficients::Identity,
+                video_full_range_flag: gufo_common::cicp::VideoRangeFlag::Full,
+            });
+        }
+
+        if format.decoder.is_animated() {
+            let (send, recv) = channel();
+            let thread =
+                std::thread::spawn(move || animated::worker(format, data, mime_type, send));
+            *loader_impelementation.decoder.lock().unwrap() = Some(Decoder::ImageRsAnimated {
+                join_handle: thread,
+                frame_receiver: recv,
+            });
+        } else {
+            *loader_impelementation.decoder.lock().unwrap() = Some(Decoder::ImageRsStatic(format));
+        }
+
+        Ok((loader_impelementation, image_info))
+    }
+
+    fn specific_frame<B: ByteData>(
+        &mut self,
+        frame_request: FrameRequest,
+    ) -> Result<Frame<B>, ProcessError> {
+        // Ensure lock on data
+        let cicp = self.cicp.lock().unwrap();
+
+        let Some(x) = std::mem::take(&mut *self.decoder.lock().unwrap()) else {
+            return Err(ProcessError::NoMoreFrames);
+        };
+
+        let mut frame = match x {
+            Decoder::ImageRsStatic(decoder) => decoder.frame().expected_error()?,
+            Decoder::ImageRsAnimated {
+                join_handle,
+                frame_receiver,
+            } => {
+                join_handle.thread().unpark();
+                let (frame, looped) = frame_receiver.recv().internal_error()??;
+
+                // Write back decoder since we need it again in the future
+                *self.decoder.lock().unwrap() = Some(Decoder::ImageRsAnimated {
+                    join_handle,
+                    frame_receiver,
+                });
+
+                if !frame_request.loop_animation
+                    && matches!(frame.details.n_frame, Some(0))
+                    && looped
+                {
+                    return Err(ProcessError::NoMoreFrames);
+                }
+                frame
+            }
+            Decoder::Exr(data) => exr::frame(&data)?,
+        };
+
+        frame.details.color_cicp = cicp.map(|x| {
+            [
+                x.color_primaries.into(),
+                x.transfer_characteristics.into(),
+                x.matrix_coefficients.into(),
+                x.video_full_range_flag.into(),
+            ]
+        });
+
+        frame.details.pixel_density = self.pixel_density.clone();
+
+        frame.into_other().expected_error()
+    }
+}
+
+pub enum ImageRsDecoder<T: std::io::BufRead + std::io::Seek> {
+    Bmp(codecs::bmp::BmpDecoder<T>),
+    Dds(codecs::dds::DdsDecoder<T>),
+    Farbfeld(codecs::farbfeld::FarbfeldDecoder<T>),
+    Gif(codecs::gif::GifDecoder<T>),
+    Hdr(codecs::hdr::HdrDecoder<T>),
+    Ico(codecs::ico::IcoDecoder<T>),
+    Jpeg(codecs::jpeg::JpegDecoder<T>),
+    Jpeg2000(hayro_jpeg2000::integration::Jp2Decoder),
+    Png(codecs::png::PngDecoder<T>),
+    Pnm(codecs::pnm::PnmDecoder<T>),
+    Qoi(codecs::qoi::QoiDecoder<T>),
+    Tga(codecs::tga::TgaDecoder<T>),
+    Tiff(codecs::tiff::TiffDecoder<T>),
+    WebP(codecs::webp::WebPDecoder<T>),
+    Xbm(image_extras::xbm::XbmDecoder<T>),
+    Xpm(image_extras::xpm::XpmDecoder<T>),
+}
+
+pub struct ImageRsFormat<T: std::io::BufRead + std::io::Seek> {
+    decoder: ImageRsDecoder<T>,
+    handler: Handler,
+}
+
+impl ImageRsFormat<Reader> {
+    fn create(data: Reader, mime_type: &str) -> Result<Self, ProcessError> {
+        Ok(match mime_type {
+            "image/apng" => Self::new(ImageRsDecoder::Png(
+                codecs::png::PngDecoder::new(data).expected_error()?,
+            ))
+            .format_name("Animated PNG")
+            .supports_two_alpha_modes(true)
+            .supports_two_grayscale_modes(true)
+            .default_bit_depth(8),
+
+            "image/bmp" => Self::new(ImageRsDecoder::Bmp(
+                codecs::bmp::BmpDecoder::new(data).expected_error()?,
+            ))
+            .format_name("BMP")
+            .default_bit_depth(8),
+
+            "image/vnd.ms-dds" => Self::new(ImageRsDecoder::Dds(
+                codecs::dds::DdsDecoder::new(data).expected_error()?,
+            ))
+            .format_name("DDS")
+            .supports_two_grayscale_modes(true),
+
+            "image/x-ff" => Self::new(ImageRsDecoder::Farbfeld(
+                codecs::farbfeld::FarbfeldDecoder::new(data).expected_error()?,
+            ))
+            .format_name("Farbfeld")
+            .default_bit_depth(16),
+
+            "image/gif" => Self::new(ImageRsDecoder::Gif(
+                codecs::gif::GifDecoder::new(data).expected_error()?,
+            ))
+            .format_name("GIF")
+            .default_bit_depth(8),
+
+            "image/x-win-bitmap" | "image/vnd.microsoft.icon" => Self::new(ImageRsDecoder::Ico(
+                codecs::ico::IcoDecoder::new(data).expected_error()?,
+            ))
+            .format_name("ICO"),
+
+            "image/jpeg" => Self::new(ImageRsDecoder::Jpeg(
+                codecs::jpeg::JpegDecoder::new(data).expected_error()?,
+            ))
+            .format_name("JPEG")
+            .default_bit_depth(8)
+            .supports_two_grayscale_modes(true),
+
+            "image/jp2" | "image/x-jp2-codestream" => Self::new(ImageRsDecoder::Jpeg2000(
+                hayro_jpeg2000::integration::Jp2Decoder::new(data).expected_error()?,
+            ))
+            .format_name("JPEG 2000"),
+
+            "image/png" => Self::new(ImageRsDecoder::Png(
+                codecs::png::PngDecoder::new(data).expected_error()?,
+            ))
+            .format_name("PNG")
+            .supports_two_alpha_modes(true)
+            .supports_two_grayscale_modes(true)
+            .default_bit_depth(8),
+
+            "image/x-portable-bitmap" => Self::new(ImageRsDecoder::Pnm(
+                codecs::pnm::PnmDecoder::new(data).expected_error()?,
+            ))
+            .format_name("PBM")
+            .default_bit_depth(1),
+
+            "image/x-portable-graymap" => Self::new(ImageRsDecoder::Pnm(
+                codecs::pnm::PnmDecoder::new(data).expected_error()?,
+            ))
+            .format_name("PGM"),
+
+            "image/x-portable-pixmap" => Self::new(ImageRsDecoder::Pnm(
+                codecs::pnm::PnmDecoder::new(data).expected_error()?,
+            ))
+            .format_name("PPM"),
+
+            "image/x-portable-anymap" => Self::new(ImageRsDecoder::Pnm(
+                codecs::pnm::PnmDecoder::new(data).expected_error()?,
+            ))
+            .format_name("PAM"),
+
+            "image/x-qoi" | "image/qoi" => Self::new(ImageRsDecoder::Qoi(
+                codecs::qoi::QoiDecoder::new(data).expected_error()?,
+            ))
+            .format_name("QOI")
+            .default_bit_depth(8)
+            .supports_two_alpha_modes(true),
+
+            "image/x-targa" | "image/x-tga" => Self::new(ImageRsDecoder::Tga(
+                codecs::tga::TgaDecoder::new(data).expected_error()?,
+            ))
+            .format_name("TGA")
+            .supports_two_grayscale_modes(true),
+
+            "image/tiff" => Self::new(ImageRsDecoder::Tiff(
+                codecs::tiff::TiffDecoder::new(data).expected_error()?,
+            ))
+            .format_name("TIFF")
+            .supports_two_alpha_modes(true)
+            .supports_two_grayscale_modes(true),
+
+            "image/webp" => Self::new(ImageRsDecoder::WebP(
+                codecs::webp::WebPDecoder::new(data).expected_error()?,
+            ))
+            .format_name("WebP")
+            .default_bit_depth(8)
+            .supports_two_alpha_modes(true),
+
+            "image/x-xbitmap" => Self::new(ImageRsDecoder::Xbm(
+                image_extras::xbm::XbmDecoder::new(data).expected_error()?,
+            ))
+            .format_name("XBM")
+            .default_bit_depth(8)
+            .supports_two_alpha_modes(false),
+
+            "image/x-xpixmap" => Self::new(ImageRsDecoder::Xpm(
+                image_extras::xpm::XpmDecoder::new(data).expected_error()?,
+            ))
+            .format_name("XPM")
+            .default_bit_depth(8)
+            .supports_two_alpha_modes(false),
+
+            "image/vnd.radiance" => Self::new(ImageRsDecoder::Hdr(
+                codecs::hdr::HdrDecoder::new_nonstrict(data).expected_error()?,
+            ))
+            .format_name("Radiance HDR"),
+
+            mime_type => return Err(ProcessError::UnsupportedImageFormat(mime_type.to_string())),
+        })
+    }
+}
+
+impl<T: std::io::BufRead + std::io::Seek> ImageRsFormat<T> {
+    pub fn format_name(mut self, format_name: impl ToString) -> Self {
+        self.handler = self.handler.format_name(format_name);
+        self
+    }
+
+    pub fn supports_two_alpha_modes(mut self, supports_two_alpha_modes: bool) -> Self {
+        self.handler = self
+            .handler
+            .supports_two_alpha_modes(supports_two_alpha_modes);
+        self
+    }
+
+    pub fn supports_two_grayscale_modes(mut self, supports_two_grayscale_modes: bool) -> Self {
+        self.handler = self
+            .handler
+            .supports_two_grayscale_modes(supports_two_grayscale_modes);
+        self
+    }
+
+    pub fn default_bit_depth(mut self, default_bit_depth: u8) -> Self {
+        self.handler = self.handler.default_bit_depth(default_bit_depth);
+        self
+    }
+
+    fn new(decoder: ImageRsDecoder<T>) -> Self {
+        Self {
+            decoder,
+            handler: Handler::default(),
+        }
+    }
+
+    fn visit<R, F: Fn(Box<&mut dyn image::ImageDecoder>) -> R>(&mut self, f: F) -> R {
+        match self.decoder {
+            ImageRsDecoder::Bmp(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Dds(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Farbfeld(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Gif(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Hdr(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Ico(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Jpeg(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Jpeg2000(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Png(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Pnm(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Qoi(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Tga(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Tiff(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::WebP(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Xbm(ref mut d) => f(Box::new(d)),
+            ImageRsDecoder::Xpm(ref mut d) => f(Box::new(d)),
+        }
+    }
+
+    fn exif_metadata(&mut self) -> Result<Option<Vec<u8>>, image::ImageError> {
+        self.visit(|x| image::ImageDecoder::exif_metadata(*x))
+    }
+
+    fn xmp_metadata(&mut self) -> Result<Option<Vec<u8>>, image::ImageError> {
+        self.visit(|x| image::ImageDecoder::xmp_metadata(*x))
+    }
+
+    fn info<B: ByteData>(&mut self) -> ImageDetails<B> {
+        match self.decoder {
+            ImageRsDecoder::Bmp(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Dds(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Farbfeld(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Gif(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Hdr(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Ico(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Jpeg(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Jpeg2000(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Png(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Pnm(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Qoi(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Tga(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Tiff(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::WebP(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Xbm(ref mut d) => self.handler.info(d),
+            ImageRsDecoder::Xpm(ref mut d) => self.handler.info(d),
+        }
+    }
+
+    fn frame<B: ByteData>(self) -> Result<Frame<B>, ProcessError> {
+        match self.decoder {
+            ImageRsDecoder::Bmp(d) => self.handler.frame(d),
+            ImageRsDecoder::Dds(d) => self.handler.frame(d),
+            ImageRsDecoder::Farbfeld(d) => self.handler.frame(d),
+            ImageRsDecoder::Gif(d) => self.handler.frame(d),
+            ImageRsDecoder::Hdr(d) => self.handler.frame(d),
+            ImageRsDecoder::Ico(d) => self.handler.frame(d),
+            ImageRsDecoder::Jpeg(d) => self.handler.frame(d),
+            ImageRsDecoder::Jpeg2000(d) => self.handler.frame(d),
+            ImageRsDecoder::Png(d) => self.handler.frame(d),
+            ImageRsDecoder::Pnm(d) => self.handler.frame(d),
+            ImageRsDecoder::Qoi(d) => self.handler.frame(d),
+            ImageRsDecoder::Tga(d) => self.handler.frame(d),
+            ImageRsDecoder::Tiff(d) => self.handler.frame(d),
+            ImageRsDecoder::WebP(d) => self.handler.frame(d),
+            ImageRsDecoder::Xbm(d) => self.handler.frame(d),
+            ImageRsDecoder::Xpm(d) => self.handler.frame(d),
+        }
+    }
+
+    fn frame_details<B: ByteData>(&mut self) -> Result<FrameDetails<B>, ProcessError> {
+        match self.decoder {
+            ImageRsDecoder::Bmp(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Dds(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Farbfeld(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Gif(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Hdr(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Ico(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Jpeg(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Jpeg2000(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Png(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Pnm(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Qoi(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Tga(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Tiff(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::WebP(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Xbm(ref mut d) => self.handler.frame_details(d),
+            ImageRsDecoder::Xpm(ref mut d) => self.handler.frame_details(d),
+        }
+    }
+
+    fn set_no_limits(&mut self) -> ImageResult<()> {
+        let limits = Limits::no_limits();
+
+        match self.decoder {
+            ImageRsDecoder::Bmp(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Dds(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Farbfeld(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Gif(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Hdr(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Ico(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Jpeg(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Jpeg2000(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Png(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Pnm(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Qoi(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Tga(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Tiff(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::WebP(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Xbm(ref mut d) => d.set_limits(limits),
+            ImageRsDecoder::Xpm(ref mut d) => d.set_limits(limits),
+        }
+    }
+}
+
+impl<'a, T: std::io::BufRead + std::io::Seek + 'a> ImageRsDecoder<T> {
+    fn into_frames(self) -> Option<image::Frames<'a>> {
+        match self {
+            Self::Png(d) => Some(d.apng().unwrap().into_frames()),
+            Self::Gif(d) => Some(d.into_frames()),
+            Self::WebP(d) => Some(d.into_frames()),
+            _ => None,
+        }
+    }
+
+    fn is_animated(&self) -> bool {
+        match self {
+            Self::Gif(_) => true,
+            Self::Png(d) => d.is_apng().unwrap(),
+            Self::WebP(d) => d.has_animation(),
+            _ => false,
+        }
+    }
+}

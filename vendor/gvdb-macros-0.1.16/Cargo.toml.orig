@@ -1,0 +1,22 @@
+[package]
+name = "gvdb-macros"
+version = "0.1.16"
+description = "Convenience macros for gvdb"
+
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+gvdb = { version = "0.10", default-features = false, features = [
+    "gresource",
+], path = "../gvdb" }
+proc-macro2 = "1.0"
+litrs = { version = "1.0", features = ["proc-macro2"] }
+quote = "1.0"

@@ -1,0 +1,32 @@
+[package]
+name = "glycin"
+version = "4.0.0"
+readme = "../README.md"
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+glycin-external = { workspace = true, optional = true }
+glycin-builtin = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+glycin-external.workspace = true
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+glycin-builtin.workspace = true
+
+[features]
+default = ["async-io"]
+gdk4 = ["glycin-external?/gdk4", "glycin-builtin?/gdk4"]
+async-io = ["glycin-external?/async-io", "glycin-builtin?/async-io"]
+gobject = ["glycin-external?/gobject", "glycin-builtin?/gobject"]
+tests = []
+tokio = ["glycin-external?/tokio", "glycin-builtin?/tokio"]

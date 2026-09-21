@@ -1,0 +1,263 @@
+use std::io::{Cursor, Read};
+
+use editing::EditingFrame;
+use glycin_utils::*;
+use gufo_common::field;
+use gufo_common::orientation::Orientation;
+use gufo_common::physical_dimension::PhysicalDimensionUnit;
+use gufo_jpeg::Jpeg;
+use zune_jpeg::zune_core::options::DecoderOptions;
+use zune_jpeg::zune_core::{self};
+
+pub struct EditJpeg {
+    buf: Vec<u8>,
+}
+
+pub fn create(
+    frame: Frame<FungibleMemory>,
+    encoding_options: EncodingOptions,
+    icc_profile: Option<Vec<u8>>,
+) -> Result<Vec<u8>, ProcessError> {
+    let mut out_buf = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(
+        &mut out_buf,
+        encoding_options
+            .quality
+            .map(|x| u8::min(x, 100))
+            .unwrap_or(90),
+    );
+
+    let color_type = match frame.memory_format {
+        MemoryFormat::R8g8b8 => jpeg_encoder::ColorType::Rgb,
+        MemoryFormat::G8 => jpeg_encoder::ColorType::Luma,
+        format => {
+            return Err(ProcessError::expected(&format!(
+                "Unsupported memory format: {format:?}"
+            )));
+        }
+    };
+
+    if let Some(icc_profile) = icc_profile {
+        let _ = encoder.add_icc_profile(&icc_profile);
+    }
+
+    if let Some(pixel_density) = frame.details.pixel_density {
+        let (unit, unit_jpeg) = match pixel_density.x().unit() {
+            PhysicalDimensionUnit::Centimeter => (
+                PhysicalDimensionUnit::Centimeter,
+                jpeg_encoder::PixelDensityUnit::Centimeters,
+            ),
+            _ => (
+                PhysicalDimensionUnit::Inch,
+                jpeg_encoder::PixelDensityUnit::Inches,
+            ),
+        };
+
+        let pixel_density = pixel_density.convert(unit);
+
+        encoder.set_density(jpeg_encoder::PixelDensity {
+            density: (
+                pixel_density.x().value().round() as u16,
+                pixel_density.y().value().round() as u16,
+            ),
+            unit: unit_jpeg,
+        });
+    }
+
+    encoder
+        .encode(
+            &frame.texture,
+            frame.width as u16,
+            frame.height as u16,
+            color_type,
+        )
+        .expected_error()?;
+
+    Ok(out_buf)
+}
+
+pub fn load<S: Read>(mut stream: S) -> Result<EditJpeg, glycin_utils::ProcessError> {
+    let mut buf: Vec<u8> = Vec::new();
+    stream.read_to_end(&mut buf).internal_error()?;
+    Ok(EditJpeg { buf })
+}
+
+pub fn apply_sparse<B: ByteData>(
+    edit_jpeg: &EditJpeg,
+    mut operations: Operations,
+) -> Result<SparseEditorOutput<B>, glycin_utils::ProcessError> {
+    let buf = edit_jpeg.buf.clone();
+    let jpeg = gufo::jpeg::Jpeg::new(buf).expected_error()?;
+
+    let metadata = gufo::Metadata::for_jpeg(&jpeg);
+    if let Some(orientation) = metadata.orientation() {
+        operations.prepend(Operations::new_orientation(orientation));
+    }
+
+    if let Some(orientation) = operations.orientation()
+        && let Some(byte_changes) = rotate_sparse(orientation, &jpeg)?
+    {
+        return Ok(SparseEditorOutput::byte_changes(byte_changes));
+    }
+
+    Ok(SparseEditorOutput::from(apply_non_sparse(
+        jpeg, operations,
+    )?))
+}
+
+pub fn apply_complete<B: ByteData>(
+    edit_jpeg: &EditJpeg,
+    mut operations: Operations,
+) -> Result<CompleteEditorOutput<B>, glycin_utils::ProcessError> {
+    let buf = edit_jpeg.buf.clone();
+
+    let jpeg = gufo::jpeg::Jpeg::new(buf).expected_error()?;
+
+    let metadata = gufo::Metadata::for_jpeg(&jpeg);
+    if let Some(orientation) = metadata.orientation() {
+        operations.prepend(Operations::new_orientation(orientation));
+    }
+
+    if let Some(orientation) = operations.orientation()
+        && let Some(byte_changes) = rotate_sparse(orientation, &jpeg)?
+    {
+        let mut data = jpeg.into_inner();
+        byte_changes.apply(&mut data).internal_error()?;
+        return CompleteEditorOutput::new_lossless(data);
+    }
+
+    apply_non_sparse(jpeg, operations)
+}
+
+fn apply_non_sparse<B: ByteData>(
+    jpeg: Jpeg,
+    operations: Operations,
+) -> Result<CompleteEditorOutput<B>, glycin_utils::ProcessError> {
+    let mut out_buf = Vec::new();
+    let encoder = jpeg.encoder(&mut out_buf).expected_error()?;
+    let mut buf = jpeg.into_inner();
+
+    // Find out what the used color encoding/model is
+    let mut decoder = zune_jpeg::JpegDecoder::new(Cursor::new(&mut buf));
+    let options = zune_core::options::DecoderOptions::new_fast()
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX);
+    decoder.set_options(options);
+
+    decoder.decode_headers().expected_error()?;
+    let colorspace = decoder.input_colorspace().expected_error()?;
+    drop(decoder);
+
+    let decoder_options = DecoderOptions::new_fast()
+        .jpeg_set_out_colorspace(colorspace)
+        .set_max_height(u32::MAX as usize)
+        .set_max_width(u32::MAX as usize);
+    let mut decoder =
+        zune_jpeg::JpegDecoder::new_with_options(Cursor::new(&mut buf), decoder_options);
+    let pixels = decoder.decode().expected_error()?;
+    let info: zune_jpeg::ImageInfo = decoder.info().expected_error()?;
+
+    let (encoder_memory_format, glycin_memory_format) = match colorspace {
+        zune_core::colorspace::ColorSpace::YCbCr => (
+            jpeg_encoder::ColorType::Ycbcr,
+            ExtendedMemoryFormat::Y8Cb8Cr8,
+        ),
+        zune_core::colorspace::ColorSpace::Luma => (
+            jpeg_encoder::ColorType::Luma,
+            ExtendedMemoryFormat::Basic(MemoryFormat::G8),
+        ),
+        zune_core::colorspace::ColorSpace::YCCK => (
+            jpeg_encoder::ColorType::Ycck,
+            ExtendedMemoryFormat::Y8Cb8Cr8K8,
+        ),
+        zune_core::colorspace::ColorSpace::RGB => (
+            jpeg_encoder::ColorType::Rgb,
+            ExtendedMemoryFormat::Basic(MemoryFormat::R8g8b8),
+        ),
+        c => {
+            return Err(ProcessError::expected(&format!(
+                "Unsupported colorspace: {c:?}"
+            )));
+        }
+    };
+
+    let editing_frame = EditingFrame {
+        width: info.width as u32,
+        height: info.height as u32,
+        stride: info.width as u32 * glycin_memory_format.n_bytes().u32(),
+        memory_format: glycin_memory_format,
+        texture: pixels.into(),
+    };
+
+    let editing_frame = editing::apply_operations(editing_frame, &operations).expected_error()?;
+
+    encoder
+        .encode(
+            &editing_frame.texture,
+            editing_frame.width as u16,
+            editing_frame.height as u16,
+            encoder_memory_format,
+        )
+        .expected_error()?;
+
+    let mut jpeg = gufo::jpeg::Jpeg::new(buf).expected_error()?;
+    let new_jpeg = Jpeg::new(out_buf).expected_error()?;
+
+    jpeg.replace_image_data(&new_jpeg).expected_error()?;
+
+    let remove_metadata_rotate = rotate_sparse(Orientation::Id, &jpeg).ok().flatten();
+
+    let mut out_buf = jpeg.into_inner();
+
+    // Since we apply all operionats, including existing exif orientation, to the
+    // image itself, the Exif entry, if it exists, is now wrong
+    if let Some(remove_metadata_rotate) = remove_metadata_rotate {
+        remove_metadata_rotate
+            .apply(&mut out_buf)
+            .internal_error()?;
+    }
+
+    let binary_data = B::try_from_vec(out_buf).expected_error()?;
+    Ok(CompleteEditorOutput::new(binary_data))
+}
+
+fn rotate_sparse(
+    orientation: Orientation,
+    jpeg: &Jpeg,
+) -> Result<Option<ByteChanges>, glycin_utils::ProcessError> {
+    let exif_data = jpeg.exif_data().map(|x| x.to_vec()).collect::<Vec<_>>();
+    let mut exif_data = exif_data.into_iter();
+    let exif_segment = jpeg
+        .exif_segments()
+        .map(|x| x.data_pos())
+        .collect::<Vec<_>>();
+    let mut exif_segment = exif_segment.iter();
+
+    if let (Some(mut exif_data), Some(exif_segment_data_pos)) =
+        (exif_data.next(), exif_segment.next())
+    {
+        let mut exif =
+            gufo_exif::ExifMutBorrowed::for_mut_slice(&mut exif_data).expected_error()?;
+
+        let diff = exif
+            .update_entry_diff(
+                field::Orientation.into(),
+                gufo_exif::Typed::Short(vec![orientation as u16]),
+            )
+            .expected_error()?;
+
+        let mut byte_changes = Vec::new();
+        for (pos, value) in diff {
+            byte_changes.push((
+                gufo::jpeg::EXIF_IDENTIFIER_STRING.len() as u64
+                    + *exif_segment_data_pos as u64
+                    + pos as u64,
+                value,
+            ));
+        }
+
+        return Ok(Some(ByteChanges::from_slice(byte_changes.as_slice())));
+    }
+
+    Ok(None)
+}

@@ -1,0 +1,7 @@
+[
+  "test_string",
+  42,
+  {
+    "bool": true
+  }
+]

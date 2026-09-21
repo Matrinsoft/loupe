@@ -1,0 +1,82 @@
+[package]
+name = "gettext-rs"
+description = "Safe bindings for gettext"
+version = "0.8.0"
+authors = ["Konstantin Salikhov <koka58@yandex.ru>", "Alexander Batischev <eual.jp@gmail.com>"]
+repository = "https://github.com/gettext-rs/gettext-rs"
+documentation = "https://docs.rs/gettext-rs/"
+homepage = "https://github.com/gettext-rs/gettext-rs"
+readme = "README.md"
+keywords = ["gettext", "binding", "ffi", "i18n", "l10n"]
+license = "MIT"
+edition = "2015"
+autotests = false # disable autodiscovery because our tests have special needs wrt setlocale calls
+
+[lib]
+name = "gettextrs"
+
+[features]
+gettext-system = ["gettext-sys/gettext-system"]
+
+[[test]]
+name = "current_textdomain_works"
+harness = false
+
+[[test]]
+name = "domain_directory_works"
+harness = false
+
+[[test]]
+name = "textdomain_codeset"
+harness = false
+
+[[test]]
+name = "gettext_fn"
+harness = false
+
+[[test]]
+name = "dgettext_fn"
+harness = false
+
+[[test]]
+name = "dcgettext_fn"
+harness = false
+
+[[test]]
+name = "pgettext_fn"
+harness = false
+
+[[test]]
+name = "ngettext_fn"
+harness = false
+
+[[test]]
+name = "dngettext_fn"
+harness = false
+
+[[test]]
+name = "dcngettext_fn"
+harness = false
+
+[[test]]
+name = "npgettext_fn"
+harness = false
+
+[[test]]
+name = "setlocale_panics_on_zero_in_locale"
+harness = false
+
+[[test]]
+name = "text_domain_error_invalid_locale"
+harness = false
+
+[[test]]
+name = "text_domain_error_translation_not_found"
+harness = false
+
+[dependencies.gettext-sys]
+version = ">= 0.21.0, <0.28.0"
+path = "../gettext-sys"
+
+[dependencies]
+locale_config = "0.3"

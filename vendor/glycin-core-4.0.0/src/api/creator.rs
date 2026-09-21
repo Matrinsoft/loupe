@@ -1,0 +1,428 @@
+use std::collections::BTreeMap;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use glib::object::IsA;
+use glib::prelude::*;
+use glycin_common::MemoryFormatInfo;
+use glycin_utils::{
+    ByteData, DimensionTooLargerError, FungibleMemory, MemoryFormat, MemoryFormatSelection,
+};
+use gufo_common::physical_dimension::PixelDensity;
+
+#[cfg(feature = "builtin")]
+use crate::config;
+use crate::config::{Config, EditorConfig};
+use crate::error::{ErrorKind, ResultExt};
+use crate::pool::Pool;
+use crate::util::CancellableFuture;
+use crate::{Error, MimeType, Processor, ProcessorContext, SandboxSelector};
+
+/// Builder pattern for creating images
+#[derive(Debug)]
+pub struct Creator {
+    mime_type: MimeType,
+    config: EditorConfig,
+    pool: Arc<Pool>,
+    pub(crate) cancellable: gio::Cancellable,
+    pub(crate) sandbox_selector: SandboxSelector,
+    encoding_options: glycin_utils::EncodingOptions,
+    new_image: glycin_utils::NewImage<FungibleMemory>,
+    new_frames: Vec<NewFrame>,
+    transform_memory_formats: bool,
+}
+
+static_assertions::assert_impl_all!(Creator: Send, Sync);
+
+/// Error for when processors do not support a feature
+///
+/// This error is not fatal. The builder pattern can still be used, but the
+/// option that returned this error will be ignored.
+#[derive(Debug, Clone)]
+pub struct FeatureNotSupported;
+
+impl std::fmt::Display for FeatureNotSupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Feature not supported by this image format.")
+    }
+}
+
+impl std::error::Error for FeatureNotSupported {}
+
+impl Creator {
+    /// Create an encoder.
+    pub async fn new(mime_type: MimeType) -> Result<Creator, Error> {
+        let config = Config::cached().await.editor(&mime_type)?.clone();
+
+        Ok(Self {
+            mime_type,
+            config,
+            pool: Pool::global(),
+            cancellable: gio::Cancellable::new(),
+            sandbox_selector: SandboxSelector::default(),
+            encoding_options: glycin_utils::EncodingOptions::default(),
+            new_image: glycin_utils::NewImage::new(glycin_utils::ImageDetails::new(1, 1), vec![]),
+            new_frames: vec![],
+            transform_memory_formats: true,
+        })
+    }
+
+    pub fn add_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        memory_format: MemoryFormat,
+        texture: Vec<u8>,
+    ) -> Result<&mut NewFrame, Error> {
+        let stride = memory_format
+            .n_bytes()
+            .u32()
+            .checked_mul(width)
+            .ok_or(DimensionTooLargerError)?;
+
+        let new_frame =
+            self.add_frame_with_stride(width, height, stride, memory_format, texture)?;
+
+        Ok(new_frame)
+    }
+
+    pub fn add_frame_with_stride(
+        &mut self,
+        width: u32,
+        height: u32,
+        stride: u32,
+        memory_format: MemoryFormat,
+        mut texture: Vec<u8>,
+    ) -> Result<&mut NewFrame, Error> {
+        let pixel_size = memory_format.n_bytes().u32();
+
+        let smallest_stride = pixel_size
+            .checked_mul(width)
+            .ok_or(DimensionTooLargerError)?;
+
+        if smallest_stride > stride {
+            return Err(ErrorKind::StrideTooSmall(format!(
+                "Stride is {stride} but must be at least {smallest_stride}"
+            ))
+            .into());
+        }
+
+        // Allow that last row doesn't have the complete stride length
+        if texture.len() < stride as usize * (height - 1) as usize + smallest_stride as usize {
+            return Err(ErrorKind::TextureWrongSize {
+                texture_size: texture.len(),
+                frame: format!("Stride size: {stride} Image size: {width} x {height}"),
+            }
+            .into());
+        }
+
+        if smallest_stride != stride {
+            let old_stride = stride as usize;
+            let new_stride = smallest_stride as usize;
+
+            let height_ = height as usize;
+            let mut source = vec![0; new_stride];
+
+            for row in 0..height_ {
+                let old_row_begin = row * old_stride;
+                let old_row_end = old_row_begin + new_stride;
+                source.copy_from_slice(&texture[old_row_begin..old_row_end]);
+
+                let new_row_begin = row * new_stride;
+                let new_row_end = new_row_begin + new_stride;
+                texture[new_row_begin..new_row_end].copy_from_slice(&source);
+            }
+
+            texture.resize(new_stride * height_, 0);
+        };
+
+        let new_frame = NewFrame::new(self.config.clone(), width, height, memory_format, texture);
+
+        self.new_frames.push(new_frame);
+
+        // TODO: Replace with push_mut once we use Rust 1.95
+        Ok(self.new_frames.last_mut().unwrap())
+    }
+
+    /// Encode an image
+    pub fn create(self) -> Pin<Box<dyn Future<Output = Result<EncodedImage, Error>> + Send>> {
+        Box::pin(async move {
+            let cancellable = self.cancellable.clone();
+
+            self.create_internal().make_cancellable(cancellable).await
+        })
+    }
+
+    async fn create_internal(self) -> Result<EncodedImage, Error> {
+        let mut new_image = self.new_image;
+
+        for frame in self.new_frames {
+            let mut frame = frame.frame()?;
+
+            if self.transform_memory_formats {
+                let creator_memory_formats = self.config.creator_memory_formats();
+
+                let target_format = if creator_memory_formats.is_empty() {
+                    tracing::warn!(
+                        "Creator configured without any supported memory formats. This will no longer be supported in the future."
+                    );
+                    frame.memory_format
+                } else {
+                    MemoryFormatSelection::from_memory_formats(creator_memory_formats)
+                        .best_format_for(frame.memory_format)
+                        .ok_or_else(|| {
+                            Error::other("Creator configured without any supported memory formats.")
+                        })?
+                };
+
+                glycin_utils::editing::change_memory_format(&mut frame, target_format)?;
+            }
+
+            new_image.frames.push(frame);
+        }
+
+        let editor_context =
+            ProcessorContext::new_sourceless(self.mime_type, &self.sandbox_selector).await?;
+
+        let editor = editor_context
+            .editor(self.pool.clone(), &self.cancellable)
+            .await?;
+
+        match editor {
+            #[cfg(feature = "external")]
+            Processor::Binary(editor) => {
+                let process = editor.process.use_();
+
+                EncodedImage::new(
+                    process
+                        .create(
+                            &editor.mime_type,
+                            new_image.into_other()?,
+                            self.encoding_options,
+                        )
+                        .await
+                        .map(|x| x.into_fungible())
+                        .err_context(&process)?,
+                )
+                .await
+            }
+            #[cfg(feature = "builtin")]
+            Processor::Builtin(builtin) => {
+                use glycin_utils::EditorImplementation;
+
+                let mime_type = builtin.mime_type.to_string();
+                let encoding_options = self.encoding_options;
+
+                let editor_function: Box<dyn FnOnce() -> _ + Send>;
+
+                match builtin.builtin {
+                    #[cfg(feature = "builtin-image-rs")]
+                    config::BuiltinProcessor::ImageRs(_) => {
+                        editor_function = Box::new(move || {
+                            glycin_image_rs::ImgEditor::create(
+                                mime_type,
+                                new_image,
+                                encoding_options,
+                            )
+                        });
+                    }
+                    #[cfg(feature = "builtin-test")]
+                    config::BuiltinProcessor::Test(_) => {
+                        editor_function = Box::new(move || {
+                            glycin_test::ImgEditor::create(mime_type, new_image, encoding_options)
+                        });
+                    }
+                }
+
+                let encoded_image = gio::spawn_blocking(|| {
+                    editor_function().map_err(|e| Error::from(e.into_editor_error()))
+                })
+                .await
+                .map_err(|e| ErrorKind::panic(e))??;
+
+                EncodedImage::new(encoded_image).await
+            }
+        }
+    }
+
+    pub fn set_encoding_quality(&mut self, quality: u8) -> Result<(), FeatureNotSupported> {
+        if !self.config.creator_encoding_quality {
+            return Err(FeatureNotSupported);
+        }
+
+        self.encoding_options.quality = Some(quality);
+        Ok(())
+    }
+
+    /// Set compression level
+    ///
+    /// This sets the lossless compression level. The range is from 0 (no
+    /// compression) to 100 (highest compression).
+    pub fn set_encoding_compression(&mut self, compression: u8) -> Result<(), FeatureNotSupported> {
+        if !self.config.creator_encoding_compression {
+            return Err(FeatureNotSupported);
+        }
+
+        self.encoding_options.compression = Some(compression);
+        Ok(())
+    }
+
+    pub fn set_metadata_key_value(
+        &mut self,
+        key_value: BTreeMap<String, String>,
+    ) -> Result<(), FeatureNotSupported> {
+        if !self.config.creator_metadata_key_value {
+            return Err(FeatureNotSupported);
+        }
+
+        self.new_image.image_info.metadata_key_value = Some(key_value);
+        Ok(())
+    }
+
+    /// Transform texture to supported memory format
+    ///
+    /// Automatically transform the textures for each frame to a memory format
+    /// that is supported by the image format. The best available format is
+    /// selected via [`MemoryFormatSelection::best_format_for`].
+    pub fn set_transform_memory_format(&mut self, transform: bool) {
+        self.transform_memory_formats = transform;
+    }
+
+    pub fn add_metadata_key_value(
+        &mut self,
+        key: String,
+        value: String,
+    ) -> Result<(), FeatureNotSupported> {
+        if !self.config.creator_metadata_key_value {
+            return Err(FeatureNotSupported);
+        }
+
+        let mut key_value = self
+            .new_image
+            .image_info
+            .metadata_key_value
+            .clone()
+            .unwrap_or_default();
+        key_value.insert(key, value);
+        self.new_image.image_info.metadata_key_value = Some(key_value);
+        Ok(())
+    }
+
+    /// Sets the method by which the sandbox mechanism is selected.
+    ///
+    /// The default without calling this function is [`SandboxSelector::Auto`].
+    pub fn sandbox_selector(&mut self, sandbox_selector: SandboxSelector) -> &mut Self {
+        self.sandbox_selector = sandbox_selector;
+        self
+    }
+
+    /// Set [`Cancellable`](gio::Cancellable) to cancel any editing operations.
+    pub fn cancellable(&mut self, cancellable: impl IsA<gio::Cancellable>) -> &mut Self {
+        self.cancellable = cancellable.upcast();
+        self
+    }
+}
+
+/// Builder pattern for a new frame
+///
+/// Returned by [`Creator.add_frame()`](`Creator::add_frame`)
+#[derive(Debug)]
+pub struct NewFrame {
+    config: EditorConfig,
+    width: u32,
+    height: u32,
+    //stride: Option<u32>,
+    memory_format: MemoryFormat,
+    texture: Vec<u8>,
+    //delay: Option<Duration>,
+    details: glycin_utils::FrameDetails<FungibleMemory>,
+    icc_profile: Option<Vec<u8>>,
+}
+
+impl NewFrame {
+    fn new(
+        config: EditorConfig,
+        width: u32,
+        height: u32,
+        memory_format: MemoryFormat,
+        texture: Vec<u8>,
+    ) -> NewFrame {
+        Self {
+            config,
+            width,
+            height,
+            memory_format,
+            texture,
+            //stride: None,
+            //delay: None,
+            details: Default::default(),
+            icc_profile: Default::default(),
+        }
+    }
+
+    pub fn set_color_icc_profile(
+        &mut self,
+        icc_profile: Option<Vec<u8>>,
+    ) -> Result<(), FeatureNotSupported> {
+        if !self.config.creator_color_icc_profile && icc_profile.is_some() {
+            return Err(FeatureNotSupported);
+        }
+
+        self.icc_profile = icc_profile;
+        Ok(())
+    }
+
+    pub fn set_pixel_density(
+        &mut self,
+        pixel_density: Option<PixelDensity>,
+    ) -> Result<(), FeatureNotSupported> {
+        if !self.config.creator_pixel_density && pixel_density.is_some() {
+            return Err(FeatureNotSupported);
+        }
+
+        self.details.pixel_density = pixel_density;
+
+        Ok(())
+    }
+
+    fn frame(self) -> Result<glycin_utils::Frame<FungibleMemory>, Error> {
+        let texture = FungibleMemory::try_from_vec(self.texture)?;
+        let mut frame = glycin_utils::Frame::<FungibleMemory>::new(
+            self.width,
+            self.height,
+            self.memory_format,
+            texture,
+        )?;
+
+        frame.details = self.details;
+
+        if let Some(icc_profile) = self.icc_profile {
+            let icc_profile = FungibleMemory::try_from_vec(icc_profile)?;
+            frame.details.color_icc_profile = Some(icc_profile);
+        }
+
+        Ok(frame)
+    }
+}
+
+/// Result of a [creator](Creator) operation
+#[derive(Debug)]
+pub struct EncodedImage {
+    pub(crate) inner: glycin_utils::EncodedImage<FungibleMemory>,
+}
+
+impl EncodedImage {
+    pub async fn new(mut inner: glycin_utils::EncodedImage<FungibleMemory>) -> Result<Self, Error> {
+        inner.final_seal().await?;
+
+        Ok(Self { inner })
+    }
+
+    pub fn data_ref(&self) -> &[u8] {
+        &self.inner.data
+    }
+
+    pub fn data_full(&self) -> Vec<u8> {
+        self.inner.data.to_vec()
+    }
+}
