@@ -118,6 +118,7 @@ sed -i -e '/Cargo.lock/d' meson.build
 
 
 %build
+export GETTEXT_SYSTEM=1
 %meson
 %meson_build
 
